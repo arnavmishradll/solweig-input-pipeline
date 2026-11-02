@@ -1,0 +1,17 @@
+# data and outputs (rasters are far too large for git)
+*/
+!qa/
+*.tif
+*.tif.part
+*.ovr
+*.f32
+*.u8
+*.laz
+*.parquet
+*.log
+*.done
+*.out
+.venv/
+__pycache__/
+qa/*.json
+qa/*.png
