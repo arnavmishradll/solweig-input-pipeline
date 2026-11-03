@@ -985,6 +985,16 @@ def step_lidar(city, cfg, grid, d, args, estimate_only=False):
         cov = np.memmap(cov_path, dtype=np.uint8, mode="r+" if os.path.exists(cov_path) else "w+", shape=(grid.height * grid.width,))
         log(f"  + vegetation grid ({grid.width * grid.height * 4 / 1e9:.1f} GB) and coverage grid ({grid.width * grid.height / 1e9:.1f} GB)")
     todo = [(k, f) for k, f in jobs if k not in done]
+
+    def map_order(job):
+        # EPT nodes in bands from north to south, west to east within a band, so writes into the working grids
+        # stay in one part of the map. In scattered order a grid larger than RAM is paged to disk constantly.
+        m = re.search(r"/(\d+)-(\d+)-(\d+)-\d+$", job[0])
+        if not m:
+            return (0, 0.0, 0.0)
+        dd, x, y = (int(v) for v in m.groups())
+        return (1, -math.floor(y / 2 ** dd * 64), x / 2 ** dd)
+    todo.sort(key=map_order)
     log(f"  {len(todo)} lidar chunks to fetch ({len(jobs) - len(todo)} done previously)")
     ndvi_thread = None
     if allc and not os.path.exists(os.path.join(d, f"{city}_ndvi.tif")):
@@ -1518,7 +1528,7 @@ def step_canopy(city, cfg, grid, d, args):
 # Step 5b: lidar canopy (needs the whole-grid lidar pass: --with-canopy)
 # --------------------------------------------------------------------------------------------
 TREE_M, MAX_TREE_M, NDVI_MIN = 2.0, 35.0, 0.12
-NDVI_WORKERS = 6  # NAIP blocks read in parallel
+NDVI_WORKERS = 4  # NAIP blocks read in parallel (6 crashed GDAL with heap corruption while lidar was downloading)
 PC_STAC = "https://planetarycomputer.microsoft.com/api/stac/v1/search"
 _pc_token = {}
 
@@ -1639,21 +1649,34 @@ def step_ndvi(city, cfg, grid, d, args):
                     part = np.zeros((h, w), np.float32)
                     reproject(src_arr, part, src_transform=tr, src_crs=crs, dst_transform=grid.block_transform(r0, c0),
                               dst_crs=grid.crs, resampling=Resampling.bilinear, src_nodata=0, dst_nodata=0,
-                              num_threads=2)
+                              num_threads=1)
                     m = (arr == 0) & (part > 0)
                     arr[m] = part[m]
         with np.errstate(invalid="ignore", divide="ignore"):
             ndvi = (nir - red) / (nir + red)
         return np.where((nir + red) > 0, np.clip(np.round(ndvi * 100 + 100), 1, 200), 0).astype(np.uint8)
 
-    with rasterio.open(tmp, "w", **prof) as dst, ThreadPoolExecutor(NDVI_WORKERS) as ex:
-        futs = {ex.submit(block, *b): b for b in blocks}
+    # finished blocks are kept as .npy files in the work folder, so a crash only loses the blocks in progress
+    bdir = os.path.join(work_dir(d), "ndvi_blocks")
+    os.makedirs(bdir, exist_ok=True)
+    bpath = lambda r0, c0: os.path.join(bdir, f"{r0}_{c0}.npy")
+    todo = [b for b in blocks if not os.path.exists(bpath(b[0], b[1]))]
+    if len(todo) < len(blocks):
+        log(f"    NDVI: {len(blocks) - len(todo)} of {len(blocks)} blocks done previously")
+    with ThreadPoolExecutor(NDVI_WORKERS) as ex:
+        futs = {ex.submit(block, *b): b for b in todo}
         for i, fut in enumerate(as_completed(futs)):
             r0, c0, h, w = futs[fut]
-            dst.write(fut.result(), 1, window=rasterio.windows.Window(c0, r0, w, h))
-            if (i + 1) % 5 == 0 or i + 1 == len(blocks):
-                log(f"    NDVI block {i + 1}/{len(blocks)}")
+            np.save(bpath(r0, c0) + ".tmp.npy", fut.result())
+            os.replace(bpath(r0, c0) + ".tmp.npy", bpath(r0, c0))
+            n = len(blocks) - len(todo) + i + 1
+            if n % 5 == 0 or n == len(blocks):
+                log(f"    NDVI block {n}/{len(blocks)}")
+    with rasterio.open(tmp, "w", **prof) as dst:
+        for r0, c0, h, w in blocks:
+            dst.write(np.load(bpath(r0, c0)), 1, window=rasterio.windows.Window(c0, r0, w, h))
     os.replace(tmp, out)
+    shutil.rmtree(bdir, ignore_errors=True)
 
 
 def step_canopylidar(city, cfg, grid, d, args):
